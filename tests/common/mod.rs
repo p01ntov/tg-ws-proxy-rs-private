@@ -210,6 +210,27 @@ pub async fn counting_mtproto_acceptor() -> (SocketAddr, JoinHandle<usize>) {
     (addr, task)
 }
 
+/// A server that accepts one connection and then never says anything.
+///
+/// The FakeTLS upstream handshake is a read of the peer's own making, so this
+/// is what an upstream that answers its SYN and then goes quiet looks like —
+/// the case that must be bounded by `--upstream-connect-timeout` rather than
+/// hanging the connect path and taking the raw-TCP last resort down with it.
+///
+/// The accepted socket is held (not dropped) for the task's lifetime: closing
+/// it would surface as a connection error instead of silence.
+pub async fn silent_acceptor() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(TASK_TIMEOUT).await;
+        drop(stream);
+    });
+
+    (addr, task)
+}
+
 pub async fn read_http_connect_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
     let mut buf = [0u8; 256];

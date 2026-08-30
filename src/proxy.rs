@@ -714,7 +714,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
         return Some(upstream);
     }
 
-    // ── An IP that just timed out is stepped over ────────────────────────
+    // ── A path that just failed is stepped over ──────────────────────────
     // A DPI-blocked DC IP does not come back within one connection's
     // lifetime, so re-probing it per connection only adds the connect
     // timeout to every single client — the delay that makes Telegram sit in
@@ -722,6 +722,54 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     // else to go; without a fallback the doomed attempt is still the only
     // path we have.
     let ip_cooling = IP_FAIL.active(target_ip) && route.has_fallback();
+
+    // A DC whose WebSocket just failed is stepped over on the same terms.
+    // Shortening the probe is not the same as skipping it: `connect_ws` swaps
+    // `--ws-connect-timeout` for `--ws-fail-probe-timeout`, which keeps the
+    // wait small but still prepends it to the fallback chain on every
+    // connection for the whole cooldown window.  When there is somewhere else
+    // to go, the tier known to be failing should not be the one that goes
+    // first.  Not an `IP_FAIL` window: that already reorders the ladder below,
+    // on a much longer clock, and the two conditions must not both fire.
+    let ws_cooling = !ip_cooling
+        && !IP_FAIL.active(target_ip)
+        && WS_FAIL.active(&(route.dc, route.is_media))
+        && route.has_fallback();
+
+    // A pooled connection is already past its handshake, so a `WS_FAIL` window
+    // is not a verdict on it: only a fresh direct connect ever clears the flag,
+    // so the pool's own background refill can succeed and leave it set.  A hit
+    // costs no I/O and beats every fallback tier, so it is checked before the
+    // ladder rather than after it.
+    //
+    // `IP_FAIL` is different — there the address itself is the suspect, and a
+    // pooled connection over a blackholed one can pass the liveness check and
+    // still be dead, so that path keeps its existing order and reaches the pool
+    // only once the fallbacks are gone.
+    if !ip_cooling && let Some(upstream) = route.pooled(target_ip).await {
+        return Some(upstream);
+    }
+
+    if ws_cooling {
+        let reason = "WS in cooldown";
+        info!(
+            "[{}] DC{}{} {} → trying fallbacks before direct WS",
+            route.label, route.dc, route.media, reason
+        );
+
+        if let Some(upstream) = route
+            .fallback_chain(target_ip, reason, route.config.cf_priority)
+            .await
+        {
+            return Some(upstream);
+        }
+
+        info!(
+            "[{}] DC{}{} every fallback failed → probing {} anyway",
+            route.label, route.dc, route.media, target_ip
+        );
+    }
+
     if ip_cooling {
         let reason = "IP in cooldown";
         info!(
@@ -748,25 +796,10 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     }
 
     // ── Pool first, then a fresh WebSocket connect ───────────────────────
-    let pooled = route
-        .pool
-        .get(
-            route.dc,
-            route.is_media,
-            target_ip,
-            route.config.skip_tls_verify,
-            !IP_FAIL.active(target_ip),
-        )
-        .await;
-    if let Some(ws) = pooled {
-        info!(
-            "[{}] DC{}{} → pool hit via {}",
-            route.label, route.dc, route.media, target_ip
-        );
-        return Some(Upstream::Ws {
-            ws,
-            framing: WsFraming::Packets,
-        });
+    // Already tried above unless the address is in cooldown, and a miss there
+    // has scheduled the refill this call would ask for again.
+    if ip_cooling && let Some(upstream) = route.pooled(target_ip).await {
+        return Some(upstream);
     }
 
     if let Some(ws) = route.direct_ws(target_ip).await {
@@ -779,8 +812,8 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     // WS failed (and is now in cooldown) — walk the rest of the ladder.
     // `--cf-priority` already tried both CF tiers above, so skip them here.
     let reason = "WS failed";
-    if ip_cooling {
-        // The re-probe above was the last thing left to try: every other tier
+    if ip_cooling || ws_cooling {
+        // The probe above was the last thing left to try: every other tier
         // already failed on the way in, and nothing since then can have
         // revived them.
         return Some(route.tcp_last_resort(target_ip, reason));
@@ -1095,6 +1128,36 @@ impl Route<'_> {
         }
 
         None
+    }
+
+    /// Take a pre-warmed direct WebSocket from the pool, if one is idle.
+    ///
+    /// A hit is the cheapest upstream there is — the TCP, TLS and WebSocket
+    /// handshakes are all already paid for — so this is worth asking before any
+    /// tier that has to dial.  A miss costs one lock and schedules the
+    /// background refill, so it is safe on the hot path but not worth asking
+    /// twice per connection.
+    async fn pooled(&self, target_ip: &str) -> Option<Upstream> {
+        let ws = self
+            .pool
+            .get(
+                self.dc,
+                self.is_media,
+                target_ip,
+                self.config.skip_tls_verify,
+                !IP_FAIL.active(target_ip),
+            )
+            .await?;
+
+        info!(
+            "[{}] DC{}{} → pool hit via {}",
+            self.label, self.dc, self.media, target_ip
+        );
+
+        Some(Upstream::Ws {
+            ws,
+            framing: WsFraming::Packets,
+        })
     }
 
     /// Open a fresh direct WebSocket to `target_ip`, applying the
@@ -1494,6 +1557,13 @@ async fn connect_mtproto_upstream(
     let port = proxy.port;
     let key_bytes = proxy.secret_key();
 
+    // `timeout` bounds reaching a usable upstream, not just its TCP handshake.
+    // The FakeTLS exchange below is a read of the peer's own making, so without
+    // a shared deadline an upstream that answers its SYN and then goes quiet
+    // hangs here with nothing to break it — and this tier sits ahead of the
+    // raw-TCP last resort, so the stall takes that path down with it.
+    let deadline = Instant::now() + timeout;
+
     // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match outbound.connect(host, port, timeout).await {
         Ok(s) => s,
@@ -1509,9 +1579,21 @@ async fn connect_mtproto_upstream(
 
     let Some(hostname) = proxy.faketls_hostname() else {
         // ── Plain MTProto path ────────────────────────────────────────────
-        if let Err(e) = writer.write_all(&handshake).await {
-            warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
-            return None;
+        match tokio::time::timeout_at(deadline.into(), writer.write_all(&handshake)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    "[upstream] {}:{} send handshake timed out after {}s",
+                    host,
+                    port,
+                    timeout.as_secs()
+                );
+                return None;
+            }
         }
 
         return Some(UpstreamConnection {
@@ -1528,30 +1610,54 @@ async fn connect_mtproto_upstream(
     let mut client_hello = build_faketls_client_hello(hostname);
     sign_faketls_client_hello(&mut client_hello, key_bytes);
 
-    if let Err(e) = writer.write_all(&client_hello).await {
-        warn!(
-            "[upstream] {}:{} FakeTLS send ClientHello error: {}",
-            host, port, e
-        );
-        return None;
-    }
+    // Whatever the TCP connect left of the budget covers the rest of the
+    // exchange: a ClientHello write, the server's fake handshake, and the init
+    // record.  One bound around all three rather than three separate ones —
+    // what matters to the caller is that the tier either yields a connection or
+    // gets out of the way in time.
+    let handshaken = tokio::time::timeout_at(deadline.into(), async {
+        if let Err(e) = writer.write_all(&client_hello).await {
+            warn!(
+                "[upstream] {}:{} FakeTLS send ClientHello error: {}",
+                host, port, e
+            );
+            return None;
+        }
 
-    // Drain the server's fake TLS handshake response.
-    if !drain_faketls_server_hello(&mut reader).await {
-        warn!(
-            "[upstream] {}:{} FakeTLS server handshake failed",
-            host, port
-        );
-        return None;
-    }
+        // Drain the server's fake TLS handshake response.
+        if !drain_faketls_server_hello(&mut reader).await {
+            warn!(
+                "[upstream] {}:{} FakeTLS server handshake failed",
+                host, port
+            );
+            return None;
+        }
 
-    // Send the 64-byte MTProto init as the first Application Data record.
-    if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
-        warn!(
-            "[upstream] {}:{} FakeTLS send MTProto init error: {}",
-            host, port, e
-        );
-        return None;
+        // Send the 64-byte MTProto init as the first Application Data record.
+        if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
+            warn!(
+                "[upstream] {}:{} FakeTLS send MTProto init error: {}",
+                host, port, e
+            );
+            return None;
+        }
+
+        Some(())
+    })
+    .await;
+
+    match handshaken {
+        Ok(Some(())) => {}
+        Ok(None) => return None,
+        Err(_) => {
+            warn!(
+                "[upstream] {}:{} FakeTLS handshake timed out after {}s",
+                host,
+                port,
+                timeout.as_secs()
+            );
+            return None;
+        }
     }
 
     Some(UpstreamConnection {

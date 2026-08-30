@@ -28,6 +28,7 @@ const SECRET: &str = "00112233445566778899aabbccddeeff";
 // fall through to TCP instead.
 const UPSTREAM_FULL_RECORD: &str = "upstream-full-record.example";
 const UPSTREAM_OVERSIZED: &str = "upstream-oversized.example";
+const UPSTREAM_SILENT: &str = "upstream-silent.example";
 
 // ─── Inbound handshake framing ───────────────────────────────────────────────
 
@@ -313,8 +314,9 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
     assert_eq!(
         connect_targets(&requests),
         [
-            // First connection probes the DC IP on both Telegram hostnames...
-            DEAD_IP,
+            // First connection probes the DC IP once: both Telegram hostnames
+            // resolve to this same address, so nothing answering its SYN is a
+            // verdict on the address and the second name is not tried.
             DEAD_IP,
             // ...then falls back to the Worker and finally to TCP.
             "worker-ipfail.example.dev:443",
@@ -324,7 +326,6 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
             // ...and only re-probes it because nothing else was left, on the
             // short cooldown clock rather than the full connect timeout.
             DEAD_IP,
-            DEAD_IP,
             "149.154.175.100:443",
         ]
         .map(|target| if target == DEAD_IP {
@@ -332,6 +333,59 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
         } else {
             target.to_string()
         })
+    );
+}
+
+#[tokio::test]
+async fn a_dc_whose_ws_failed_tries_the_fallbacks_before_probing_it_again() {
+    // A shorter probe timeout still puts a known-failing tier at the *front* of
+    // the ladder, so every connection for the whole cooldown window waits it out
+    // before reaching a path that works. Ordering is what removes the wait: the
+    // direct attempt goes last, and only happens at all because nothing else was
+    // left — the same self-healing shape the IP cooldown uses.
+    //
+    // A rejected CONNECT is deliberate: it fails the WebSocket without timing
+    // out the TCP connect, so this exercises the WS cooldown on its own rather
+    // than the IP one.
+    const WS_FAIL_IP: &str = "149.154.171.6";
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--cf-worker-domain",
+                "worker-wsfail.example.dev",
+                "--dc-ip",
+                &format!("5:{WS_FAIL_IP}"),
+                "--cf-fail-cooldown",
+                "0",
+            ],
+        )
+    };
+
+    run_proxy_once_for_dc(make_config(), 5).await;
+    run_proxy_once_for_dc(make_config(), 5).await;
+
+    let dc_ip = format!("{WS_FAIL_IP}:443");
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            // First connection tries the direct WebSocket first, both hostnames
+            // — a refusal is a verdict on the name, not on the address, so the
+            // second one is still worth a try.
+            dc_ip.as_str(),
+            dc_ip.as_str(),
+            // ...then the Worker, then TCP.
+            "worker-wsfail.example.dev:443",
+            "149.154.171.5:443",
+            // The second one reaches the Worker *before* the direct path...
+            "worker-wsfail.example.dev:443",
+            // ...and only probes it because the Worker failed too.
+            dc_ip.as_str(),
+            dc_ip.as_str(),
+            "149.154.171.5:443",
+        ]
     );
 }
 
@@ -420,6 +474,38 @@ async fn faketls_client_handshake(
     write_tls_appdata(&mut writer, &handshake).await.unwrap();
 
     (reader, writer)
+}
+
+#[tokio::test]
+async fn a_silent_faketls_upstream_is_bounded_by_the_connect_timeout() {
+    // `--upstream-connect-timeout` used to cover only the TCP connect, while
+    // the FakeTLS exchange that follows is a read of the peer's own making. An
+    // upstream that answered its SYN and then went quiet hung the connect path
+    // with nothing to break it — and this tier sits ahead of the raw-TCP last
+    // resort, so the stall took that path down too. The whole handshake now
+    // shares one deadline, so the ladder still reaches TCP.
+    let (silent_addr, silent_task) = common::silent_acceptor().await;
+    let (proxy_addr, proxy_task) = common::tunneling_http_proxy(silent_addr).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--mtproto-proxy",
+            &format!("{UPSTREAM_SILENT}:443:ee{SECRET}6578616d706c652e636f6d"),
+        ],
+    );
+
+    // Would never return before the fix: the drain awaits a record that is
+    // never sent, so the test would hang here rather than fail.
+    tokio::time::timeout(Duration::from_secs(15), run_proxy_once(config))
+        .await
+        .expect("a silent FakeTLS upstream hung the connect path");
+
+    let request = await_proxy_request(proxy_task).await;
+    assert!(
+        request.starts_with(&format!("CONNECT {UPSTREAM_SILENT}:443 HTTP/1.1")),
+        "expected the upstream tier to be attempted, got {request:?}"
+    );
+    silent_task.abort();
 }
 
 #[tokio::test]

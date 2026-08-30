@@ -17,7 +17,7 @@
 //! `verify_mode = CERT_NONE`.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::websocket_dc;
 use crate::outbound::OutboundConnector;
@@ -204,6 +204,14 @@ async fn connect_ws_with_path(
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
 ) -> WsConnectResult {
+    // `timeout` bounds the whole attempt, not each phase in turn.  Sharing one
+    // deadline is what keeps the routing ladder's arithmetic honest: the TCP
+    // connect and the TLS+upgrade used to get the full duration each, so a
+    // hostname that answered its SYN and then stalled cost 2x the configured
+    // value, and the two-hostname loop below turned `--ws-connect-timeout` into
+    // a 4x wait before the next tier was even tried.
+    let deadline = Instant::now() + timeout;
+
     // ── TCP connection to the configured IP ──────────────────────────────
     let tcp = match outbound.connect(ip, 443, timeout).await {
         Ok(s) => s,
@@ -241,8 +249,9 @@ async fn connect_ws_with_path(
     }
 
     // ── TLS handshake + WebSocket upgrade ─────────────────────────────────
-    let result = tokio::time::timeout(
-        timeout,
+    // Whatever the TCP connect did not spend, and no more.
+    let result = tokio::time::timeout_at(
+        deadline.into(),
         tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override),
     )
     .await;
@@ -453,6 +462,13 @@ pub async fn connect_ws_for_dc_with_outbound(
 
                 all_redirects = false;
                 any_connect_timed_out = true;
+                // Every hostname here dials the *same* `ip`; only the SNI and
+                // `Host` differ, and both are chosen after the TCP handshake.
+                // So nothing at `ip:443` answering is a verdict on the address,
+                // not on the name — retrying the next one can only burn a
+                // second full timeout before the next tier gets its turn.
+                // The other arms are per-hostname and must keep iterating.
+                break;
             }
         }
     }

@@ -9,7 +9,10 @@ use tg_ws_proxy_rs::ws_client::{
 
 mod common;
 
-use common::{await_proxy_request, rejecting_http_proxy};
+use common::{
+    await_proxy_request, await_proxy_requests, rejecting_http_proxy, rejecting_http_proxy_requests,
+    stalling_http_proxy_requests,
+};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -109,8 +112,35 @@ async fn ws_client_connects_through_outbound_proxy() {
 }
 
 #[tokio::test]
+async fn a_tcp_connect_timeout_stops_the_hostname_loop_instead_of_redialling_the_same_address() {
+    // Both hostnames for a DC dial the same address; only the SNI and `Host`
+    // differ, and those are chosen after the TCP handshake. So nothing
+    // answering the SYN is a verdict on the address, and trying the second
+    // name could only burn a second full timeout before the next tier starts.
+    const DEAD_IP: &str = "149.154.175.101";
+    let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DEAD_IP).await;
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
+
+    let attempt =
+        connect_ws_for_dc_with_outbound(DEAD_IP, 2, false, false, PROBE_TIMEOUT, &outbound, None)
+            .await;
+
+    assert!(attempt.ws.is_none());
+    assert!(attempt.connect_timed_out);
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(requests.len(), 1, "the same address must not be re-dialled");
+}
+
+#[tokio::test]
 async fn telegram_ws_dc_connector_uses_outbound_proxy() {
-    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    // Serves every attempt, not just the first: this DC has two hostnames and a
+    // refusal on one is no verdict on the other, so both are dialled. A
+    // one-shot fixture leaves the second connect sitting in a closed listener's
+    // backlog, which on some platforms reads as a *timeout* rather than a
+    // refusal — the exact distinction this test exists to pin down.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
 
@@ -131,8 +161,13 @@ async fn telegram_ws_dc_connector_uses_outbound_proxy() {
     assert!(!attempt.all_redirects);
     assert!(!attempt.upgrade_timed_out);
     assert!(!attempt.connect_timed_out);
-    let request = await_proxy_request(proxy_task).await;
-    assert!(request.starts_with("CONNECT 203.0.113.10:443 HTTP/1.1"));
+    let requests = await_proxy_requests(proxy_task).await;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("CONNECT 203.0.113.10:443 HTTP/1.1")),
+        "every attempt must dial the configured IP, got {requests:?}"
+    );
 }
 
 #[tokio::test]
