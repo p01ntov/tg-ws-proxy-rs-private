@@ -269,6 +269,22 @@ tg-ws-proxy --log-file proxy.log
 TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
 ```
 
+### End-to-end latency probe
+
+The `mtproto_probe` example tests a running proxy by sending a real
+`req_pq_multi` to Telegram and validating the returned `resPQ`. It reports
+success rate, mean, p50, p95 and maximum latency. No Telegram account or API
+credentials are required. Keep the proxy secret out of the command line:
+
+```bash
+TG_SECRET=0123456789abcdef0123456789abcdef \
+  cargo run --release --example mtproto_probe -- 192.168.1.1:2443 2 20
+
+# Negative DC index probes the media route.
+TG_SECRET=0123456789abcdef0123456789abcdef \
+  cargo run --release --example mtproto_probe -- 192.168.1.1:2443 -2 20
+```
+
 ## How it works
 
 1. Telegram Desktop connects to the proxy on `127.0.0.1:1443`.

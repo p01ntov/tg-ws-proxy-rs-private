@@ -32,7 +32,7 @@ const QUIET_PERIOD: Duration = Duration::from_millis(300);
 
 /// Same idea for [`stalling_http_proxy_requests`], but it has to outlast the
 /// connect timeout every stalled attempt burns before the next one arrives.
-const STALL_QUIET_PERIOD: Duration = Duration::from_millis(1500);
+const STALL_QUIET_PERIOD: Duration = Duration::from_millis(2500);
 
 /// Install the process-wide rustls crypto provider.
 ///
